@@ -1,0 +1,160 @@
+<!doctype html>
+<html lang="tr">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Room {{ room_id }} - Play</title>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial; margin: 24px; }
+    .grid { display: grid; grid-template-columns: 380px 1fr; gap: 16px; align-items: start; }
+    .card { border: 1px solid #e5e5e5; border-radius: 12px; padding: 16px; }
+    .row { display:flex; justify-content: space-between; padding: 6px 0; border-bottom: 1px solid #f2f2f2; }
+    .row:last-child { border-bottom: none; }
+    .badge { display:inline-block; padding: 4px 10px; border-radius: 999px; font-size: 12px; border: 1px solid #ddd; }
+    .badge.ok { border-color: #9dd7a8; color: #1f7a33; }
+    .badge.bad { border-color: #f3a6a6; color: #a01616; }
+    input { width: 140px; padding: 10px; border-radius: 10px; border: 1px solid #ddd; }
+    button { padding: 10px 14px; border-radius: 10px; border: 1px solid #ddd; background:#fff; cursor:pointer; }
+    button:disabled { opacity: .45; cursor:not-allowed; }
+    pre { white-space: pre-wrap; word-break: break-word; margin: 0; font-size: 12px; }
+    .muted { color: #666; font-size: 13px; }
+  </style>
+</head>
+<body>
+
+<h1>Room - Play</h1>
+<p class="muted">
+  Bu sayfa websocket’e bağlanır ve oyunu UI’dan oynatır. İki oyuncu testi için normal pencere + incognito ile ayrı login ol.
+</p>
+
+<div class="grid">
+  <div class="card">
+    <div class="row"><strong>WS Durumu</strong><span id="wsStatus" class="badge bad">Kapalı</span></div>
+    <div class="row"><span>Room</span><span id="roomVal">-</span></div>
+    <div class="row"><span>Status</span><span id="statusVal">-</span></div>
+    <div class="row"><span>Bet</span><span id="betVal">-</span></div>
+    <div class="row"><span>Players</span><span id="playersVal">-</span></div>
+    <div class="row"><span>Turn</span><span id="turnVal">-</span></div>
+    <div class="row"><span>Winner</span><span id="winnerVal">-</span></div>
+    <div class="row"><span>Finished At</span><span id="finishedVal">-</span></div>
+
+    <hr style="border:none;border-top:1px solid #f0f0f0;margin:14px 0;">
+
+    <div style="display:flex; gap:10px; align-items:center;">
+      <input id="guessInput" type="number" min="1" max="100" placeholder="1-100" />
+      <button id="sendBtn" disabled>Guess Gönder</button>
+    </div>
+    <p class="muted" style="margin-top:10px;">
+      Not: “Turn sende değil” ise buton kilitlenir. Oyun bittiğinde “FINISHED” görürsün.
+    </p>
+  </div>
+
+  <div class="card">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
+      <strong>Event Log</strong>
+      <button id="clearBtn">Temizle</button>
+    </div>
+    <pre id="log"></pre>
+  </div>
+</div>
+
+<script>
+  const ME = "{{ request.user.username }}";
+  const ROOM_ID = {{ room_id }};
+
+  // ... (senin dom query'lerin)
+
+  let ws;
+  let lastSnapshot = null;
+
+  function render(snapshot) {
+    lastSnapshot = snapshot;
+    const p = snapshot || {};
+
+    roomVal.textContent = p.room ?? "-";
+    statusVal.textContent = p.status ?? "-";
+    betVal.textContent = p.bet_amount ?? "-";
+    playersVal.textContent = (p.players || []).filter(Boolean).join(" vs ") || "-";
+    turnVal.textContent = p.turn ?? "-";
+    winnerVal.textContent = p.winner ?? "-";
+    finishedVal.textContent = p.finished_at ?? "-";
+
+    const isFull = p.status === "full" && (p.players || []).filter(Boolean).length === 2;
+    const isFinished = p.status === "finished";
+    const myTurn = p.turn && p.turn === ME;
+
+    // helper text alanın varsa:
+    const helper = document.getElementById("helperText"); // yoksa ekle
+    if (helper) {
+      if (!isFull) helper.textContent = "İkinci oyuncu bekleniyor veya room FULL değil.";
+      else if (isFinished) helper.textContent = "Oyun bitti.";
+      else if (myTurn) helper.textContent = "Sıra sende.";
+      else helper.textContent = "Sıra rakipte.";
+    }
+
+    // input/button state
+    guessInput.disabled = !isFull || isFinished || !myTurn;
+    sendBtn.disabled = !isFull || isFinished || !myTurn;
+
+    // WS badge zaten var sende
+  }
+
+  function connect() {
+    const proto = window.location.protocol === "https:" ? "wss" : "ws";
+    const wsUrl = `${proto}://${window.location.host}/ws/rooms/${ROOM_ID}/`;
+    append(`Connecting: ${wsUrl}`);
+    ws = new WebSocket(wsUrl);
+
+    ws.onopen = () => { setWsBadge(true); append("WS OPEN"); };
+
+    ws.onmessage = (e) => {
+      let data;
+      try { data = JSON.parse(e.data); } catch { data = { raw: e.data }; }
+      append(`RECV: ${JSON.stringify(data)}`);
+
+      if (data.type === "SNAPSHOT") render(data.payload || {});
+      if (data.type === "INFO") {
+        // INFO gelince state’e göre zaten render ediyoruz; sadece log yeter.
+      }
+      if (data.type === "ERROR") {
+        const detail = data?.payload?.detail || "Unknown error";
+        // Sıra değilse zaten render kilitler; burada sadece log
+      }
+      if (data.type === "GAME_EVENT") {
+        // Event sonrası yeni snapshot basmak en sağlıklısı.
+        // Ama backend snapshot göndermiyorsa, eldeki snapshot’ı event ile güncelle:
+        const ev = data.payload || {};
+        if (lastSnapshot) {
+          const next = structuredClone(lastSnapshot);
+          if (ev.event === "GUESS") next.turn = ev.next_turn || next.turn;
+          if (ev.event === "GAME_OVER") {
+            next.status = ev.status || "finished";
+            next.winner = ev.winner || next.winner;
+          }
+          render(next);
+        }
+      }
+    };
+
+    ws.onclose = (e) => {
+      setWsBadge(false, ` (${e.code})`);
+      append(`WS CLOSED code=${e.code} reason=${e.reason || ""}`);
+      // güvenli tarafta kal: UI kilitle
+      guessInput.disabled = true;
+      sendBtn.disabled = true;
+    };
+  }
+
+  sendBtn.onclick = () => {
+    const v = Number(guessInput.value);
+    if (!v) return;
+    const msg = { type: "GUESS", payload: { value: v } };
+    append(`SEND: ${JSON.stringify(msg)}`);
+    ws.send(JSON.stringify(msg));
+  };
+
+  connect();
+</script>
+
+</body>
+</html>

@@ -1,0 +1,239 @@
+<!doctype html>
+<html lang="tr">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Room {{ room_id }} - Play</title>
+  <style>
+    body { font-family: -apple-system, system-ui, Segoe UI, Roboto, Arial; margin: 24px; }
+    .row { display: flex; gap: 16px; align-items: flex-start; }
+    .card { border: 1px solid #ddd; border-radius: 10px; padding: 16px; width: 520px; }
+    .muted { color: #666; }
+    .badge { display: inline-block; padding: 4px 8px; border-radius: 999px; border: 1px solid #ddd; font-size: 12px; }
+    .ok { border-color: #3aa655; color: #1f7a3a; }
+    .warn { border-color: #e0a800; color: #8a6d00; }
+    .bad { border-color: #d9534f; color: #a94442; }
+    button { padding: 10px 12px; border-radius: 10px; border: 1px solid #111; background: #111; color: #fff; cursor: pointer; }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+    input { padding: 10px 12px; border-radius: 10px; border: 1px solid #ddd; width: 140px; }
+    .log { height: 300px; overflow: auto; background: #fafafa; border: 1px solid #eee; border-radius: 10px; padding: 10px; white-space: pre-wrap; }
+    .kv { display: grid; grid-template-columns: 140px 1fr; gap: 8px; }
+    .kv div { padding: 4px 0; }
+  </style>
+</head>
+<body>
+  <h1>Room {{ room_id }} - Play</h1>
+  <p class="muted">
+    Bu sayfa websocket’e bağlanır ve oyunu UI’dan oynatır.
+    İki oyuncu testi için: normal pencere + incognito ile ayrı login ol.
+  </p>
+
+  <div class="row">
+    <div class="card">
+      <div class="kv">
+        <div class="muted">WS Durumu</div>
+        <div><span id="wsStatus" class="badge warn">Bağlanıyor...</span></div>
+
+        <div class="muted">Room</div>
+        <div id="roomId">{{ room_id }}</div>
+
+        <div class="muted">Status</div>
+        <div id="roomStatus">-</div>
+
+        <div class="muted">Bet</div>
+        <div id="betAmount">-</div>
+
+        <div class="muted">Players</div>
+        <div id="players">-</div>
+
+        <div class="muted">Turn</div>
+        <div id="turn">-</div>
+
+        <div class="muted">Winner</div>
+        <div id="winner">-</div>
+
+        <div class="muted">Finished At</div>
+        <div id="finishedAt">-</div>
+      </div>
+
+      <hr />
+
+      <div style="display:flex; gap:10px; align-items:center;">
+        <input id="guessInput" type="number" min="1" max="100" placeholder="1-100" />
+        <button id="guessBtn" disabled>Guess Gönder</button>
+        <span id="hint" class="muted"></span>
+      </div>
+
+      <p class="muted" style="margin-top:10px;">
+        Not: “Turn sende değil” ise buton kilitlenir. Oyun bittiğinde “FINISHED” görürsün.
+      </p>
+    </div>
+
+    <div class="card">
+      <div style="display:flex; justify-content:space-between; align-items:center;">
+        <h3 style="margin:0;">Event Log</h3>
+        <button id="clearBtn" style="background:#fff;color:#111;">Temizle</button>
+      </div>
+      <div id="log" class="log" style="margin-top:12px;"></div>
+    </div>
+  </div>
+
+  <script>
+    const roomId = Number("{{ room_id }}");
+    const wsUrl = `ws://${window.location.host}/ws/rooms/${roomId}/`;
+
+    const wsStatusEl = document.getElementById("wsStatus");
+    const roomStatusEl = document.getElementById("roomStatus");
+    const betAmountEl = document.getElementById("betAmount");
+    const playersEl = document.getElementById("players");
+    const turnEl = document.getElementById("turn");
+    const winnerEl = document.getElementById("winner");
+    const finishedAtEl = document.getElementById("finishedAt");
+
+    const guessInput = document.getElementById("guessInput");
+    const guessBtn = document.getElementById("guessBtn");
+    const hintEl = document.getElementById("hint");
+
+    const logEl = document.getElementById("log");
+    const clearBtn = document.getElementById("clearBtn");
+
+    let latestSnapshot = null;
+
+    function log(line) {
+      const ts = new Date().toLocaleTimeString();
+      logEl.textContent += `[${ts}] ${line}\n`;
+      logEl.scrollTop = logEl.scrollHeight;
+    }
+
+    function setWsStatus(kind, text) {
+      wsStatusEl.className = "badge " + kind;
+      wsStatusEl.textContent = text;
+    }
+
+    function renderSnapshot(payload) {
+      latestSnapshot = payload;
+
+      roomStatusEl.textContent = payload.status ?? "-";
+      betAmountEl.textContent = payload.bet_amount ?? "-";
+      playersEl.textContent = (payload.players || []).filter(Boolean).join(" vs ") || "-";
+      turnEl.textContent = payload.turn ?? "-";
+      winnerEl.textContent = payload.winner ?? "-";
+      finishedAtEl.textContent = payload.finished_at ?? "-";
+
+      // UI enable/disable
+      const status = payload.status;
+      const hasTwoPlayers = (payload.players || []).filter(Boolean).length === 2;
+      const isFinished = status === "finished";
+      const waiting = !hasTwoPlayers || status !== "full";
+
+      if (isFinished) {
+        guessBtn.disabled = true;
+        hintEl.textContent = "Oyun bitti.";
+        return;
+      }
+
+      if (waiting) {
+        guessBtn.disabled = true;
+        hintEl.textContent = "İkinci oyuncu bekleniyor veya room FULL değil.";
+        return;
+      }
+
+      // Turn bilgisine göre: burada “kendim kimim”i bilmediğimiz için butonu tamamen kilitlemiyoruz.
+      // Turn sende değilse server zaten "Not your turn" dönecek; onu log’dan göreceksin.
+      guessBtn.disabled = false;
+      hintEl.textContent = "";
+    }
+
+    function sendGuess() {
+      const v = Number(guessInput.value);
+      if (!Number.isFinite(v) || v < 1 || v > 100) {
+        hintEl.textContent = "1-100 arası sayı gir.";
+        return;
+      }
+      hintEl.textContent = "";
+      ws.send(JSON.stringify({ type: "GUESS", payload: { value: v } }));
+      log(`SEND GUESS: ${v}`);
+    }
+
+    clearBtn.addEventListener("click", () => {
+      logEl.textContent = "";
+    });
+
+    guessBtn.addEventListener("click", sendGuess);
+    guessInput.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") sendGuess();
+    });
+
+    setWsStatus("warn", "Bağlanıyor...");
+    log(`Connecting: ${wsUrl}`);
+
+    const ws = new WebSocket(wsUrl);
+
+    ws.onopen = () => {
+      setWsStatus("ok", "Bağlandı");
+      log("WS OPEN");
+    };
+
+    ws.onmessage = (e) => {
+      try {
+        const msg = JSON.parse(e.data);
+
+        if (msg.type === "SNAPSHOT") {
+          log("SNAPSHOT received");
+          renderSnapshot(msg.payload);
+          return;
+        }
+
+        if (msg.type === "GAME_EVENT") {
+          const p = msg.payload || {};
+          log(`GAME_EVENT: ${JSON.stringify(p)}`);
+
+          // Event geldiğinde turn/winner değişebilir, en basit yaklaşım:
+          // payload turn bilgisi içeriyorsa UI’daki turn’u güncelle.
+          if (p.next_turn) turnEl.textContent = p.next_turn;
+
+          // Oyun bitti event’i
+          if (p.event === "GAME_OVER" || p.result === "correct") {
+            roomStatusEl.textContent = p.status || "finished";
+            winnerEl.textContent = p.winner || "-";
+            guessBtn.disabled = true;
+            hintEl.textContent = "Oyun bitti.";
+          } else {
+            // higher/lower
+            if (p.result === "higher" || p.result === "lower") {
+              hintEl.textContent = `İpucu: ${p.result}`;
+            }
+          }
+          return;
+        }
+
+        if (msg.type === "INFO") {
+          log(`INFO: ${msg.payload?.detail || ""}`);
+          return;
+        }
+
+        if (msg.type === "ERROR") {
+          log(`ERROR: ${msg.payload?.detail || "Unknown error"}`);
+          // ERROR gelince hemen kapatmak yerine logla; server tarafı 1011 kapatıyorsa close’a düşer.
+          return;
+        }
+
+        log(`UNKNOWN MSG: ${e.data}`);
+      } catch (err) {
+        log(`PARSE ERROR: ${String(err)}`);
+      }
+    };
+
+    ws.onerror = (e) => {
+      setWsStatus("bad", "Hata");
+      log("WS ERROR");
+    };
+
+    ws.onclose = (e) => {
+      setWsStatus("bad", `Kapandı (${e.code})`);
+      log(`WS CLOSED code=${e.code} reason=${e.reason || ""}`);
+      guessBtn.disabled = true;
+    };
+  </script>
+</body>
+</html>

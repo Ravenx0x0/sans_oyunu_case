@@ -1,0 +1,166 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Lobby</title>
+    <style>
+      body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial; margin: 24px; }
+      .row { display: flex; gap: 24px; align-items: flex-start; }
+      .card { border: 1px solid #ddd; border-radius: 10px; padding: 16px; width: 420px; }
+      table { width: 100%; border-collapse: collapse; }
+      th, td { border-bottom: 1px solid #eee; padding: 8px; font-size: 14px; text-align: left; }
+      input, button { padding: 10px; font-size: 14px; }
+      button { cursor: pointer; }
+      .muted { color: #666; font-size: 13px; }
+      .ok { color: #0a7; }
+      .err { color: #c00; }
+      a { color: #06c; text-decoration: none; }
+      a:hover { text-decoration: underline; }
+    </style>
+  </head>
+  <body>
+    <h1>Lobby</h1>
+    <div class="muted">Login olmuş kullanıcı ile çalışır. API session + CSRF kullanıyoruz.</div>
+
+    <div class="row">
+      <div class="card">
+        <h3>Ben</h3>
+        <div id="me">Yükleniyor…</div>
+      </div>
+
+      <div class="card">
+        <h3>Oda oluştur</h3>
+        <div class="muted">Bet amount gir → oda açılır.</div>
+        <div style="margin-top: 10px; display:flex; gap: 10px;">
+          <input id="bet" type="number" placeholder="bet_amount" />
+          <button id="create">Create</button>
+        </div>
+        <div id="createMsg" style="margin-top:10px;"></div>
+      </div>
+    </div>
+
+    <div class="row" style="margin-top:24px;">
+      <div class="card" style="width: 864px;">
+        <h3>Odalar</h3>
+        <button id="refresh">Refresh</button>
+        <div id="roomsMsg" style="margin: 10px 0;"></div>
+        <table>
+          <thead>
+            <tr>
+              <th>ID</th>
+              <th>Bet</th>
+              <th>Status</th>
+              <th>P1</th>
+              <th>P2</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody id="rooms"></tbody>
+        </table>
+      </div>
+    </div>
+
+    <script>
+      function getCookie(name) {
+        const v = document.cookie.match("(^|;)\\s*" + name + "\\s*=\\s*([^;]+)");
+        return v ? v.pop() : "";
+      }
+
+      async function api(path, opts = {}) {
+        const headers = opts.headers || {};
+        headers["Content-Type"] = "application/json";
+        // Session auth + CSRF
+        if (opts.method && opts.method.toUpperCase() !== "GET") {
+          headers["X-CSRFToken"] = getCookie("csrftoken");
+        }
+        const res = await fetch("/api/" + path, { ...opts, headers });
+        const text = await res.text();
+        let data;
+        try { data = JSON.parse(text); } catch { data = { raw: text }; }
+        if (!res.ok) {
+          const msg = data.detail || JSON.stringify(data);
+          throw new Error(msg);
+        }
+        return data;
+      }
+
+      async function loadMe() {
+        try {
+          const me = await api("me/");
+          document.getElementById("me").innerHTML =
+            `<div><b>${me.username}</b> (${me.email || "-"})</div>
+             <div>Balance: <b>${me.balance}</b></div>`;
+        } catch (e) {
+          document.getElementById("me").innerHTML = `<div class="err">${e.message}</div>`;
+        }
+      }
+
+      function roomRow(r) {
+        const canJoin = (r.status === "open" && !r.player2_id);
+        const joinBtn = canJoin
+          ? `<button onclick="joinRoom(${r.id})">Join</button>`
+          : "";
+        const playLink = `<a href="/play/${r.id}/">Play</a>`;
+        return `
+          <tr>
+            <td>${r.id}</td>
+            <td>${r.bet_amount}</td>
+            <td>${r.status}</td>
+            <td>${r.player1_id ?? "-"}</td>
+            <td>${r.player2_id ?? "-"}</td>
+            <td style="display:flex; gap:10px; align-items:center;">
+              ${joinBtn} ${playLink}
+            </td>
+          </tr>
+        `;
+      }
+
+      async function loadRooms() {
+        const el = document.getElementById("rooms");
+        const msg = document.getElementById("roomsMsg");
+        msg.innerHTML = "";
+        try {
+          const rooms = await api("rooms/");
+          el.innerHTML = rooms.map(roomRow).join("");
+        } catch (e) {
+          msg.innerHTML = `<div class="err">${e.message}</div>`;
+        }
+      }
+
+      window.joinRoom = async function(roomId) {
+        const msg = document.getElementById("roomsMsg");
+        msg.innerHTML = "";
+        try {
+          await api(`rooms/${roomId}/join/`, { method: "POST", body: JSON.stringify({}) });
+          msg.innerHTML = `<div class="ok">Joined room ${roomId}</div>`;
+          await loadRooms();
+        } catch (e) {
+          msg.innerHTML = `<div class="err">${e.message}</div>`;
+        }
+      }
+
+      async function createRoom() {
+        const bet = Number(document.getElementById("bet").value);
+        const msg = document.getElementById("createMsg");
+        msg.innerHTML = "";
+        if (!bet) {
+          msg.innerHTML = `<div class="err">bet_amount gir</div>`;
+          return;
+        }
+        try {
+          const r = await api("rooms/", { method: "POST", body: JSON.stringify({ bet_amount: bet }) });
+          msg.innerHTML = `<div class="ok">Room created: ${r.id}</div>`;
+          await loadRooms();
+        } catch (e) {
+          msg.innerHTML = `<div class="err">${e.message}</div>`;
+        }
+      }
+
+      document.getElementById("refresh").addEventListener("click", loadRooms);
+      document.getElementById("create").addEventListener("click", createRoom);
+
+      loadMe();
+      loadRooms();
+    </script>
+  </body>
+</html>
