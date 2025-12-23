@@ -1,6 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { useParams, Link } from "react-router-dom";
-import { API_BASE, getToken, api } from "../api";
+import { API_BASE, api, getToken } from "../api";
 
 export default function RoomPlay() {
   const { id } = useParams();
@@ -339,7 +339,7 @@ const alert = {
   color: "#ffb4b4",
 };
 
-const playersGrid = { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14, marginBottom: 16 };
+const playersGrid = { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 4, marginBottom: 16 };
 
 const playerCard = (active) => ({
   border: `1px solid ${active ? "#3b5bff" : "#2a2a2a"}`,
@@ -375,7 +375,7 @@ const guessRow = { display: "flex", gap: 10, alignItems: "row" };
 
 const guessInput = {
   marginTop: 6,
-  width: "100%",
+  width: "60%",
   padding: "12px 12px",
   borderRadius: 12,
   border: "1px solid #2a2a2a",
@@ -463,3 +463,4 @@ const ctaBtnDisabled = {
   opacity: 0.45,
   cursor: "not-allowed",
 };
+

@@ -1,6 +1,6 @@
 import random
 
-from django.contrib.auth import authenticate, get_user_model, login
+from django.contrib.auth import authenticate, get_user_model
 from django.contrib.auth.decorators import login_required
 from django.db import transaction
 from django.db.models import F
@@ -19,16 +19,11 @@ User = get_user_model()
 
 
 class ApiLoginView(APIView):
-    """
-    React için:
-    POST /api/auth/login/  { "username": "...", "password": "..." }
-    -> { "token": "...", "user": {...} }
-    """
     permission_classes = [AllowAny]
 
     def post(self, request):
-        username = (request.data.get("username") or "").strip()
-        password = request.data.get("password") or ""
+        username = request.data.get("username")
+        password = request.data.get("password")
 
         user = authenticate(username=username, password=password)
         if not user:
@@ -36,12 +31,6 @@ class ApiLoginView(APIView):
                 {"non_field_errors": ["Unable to log in with provided credentials."]},
                 status=status.HTTP_400_BAD_REQUEST,
             )
-
-        # Session'ı da açalım (admin/template tarafını kolaylaştırır; React’ı bozmaz)
-        try:
-            login(request, user)
-        except Exception:
-            pass
 
         token, _ = Token.objects.get_or_create(user=user)
         return Response({"token": token.key, "user": {"id": user.id, "username": user.username}})
@@ -56,7 +45,7 @@ class MeView(APIView):
             {
                 "id": u.id,
                 "username": u.username,
-                "email": u.email,
+                "email": getattr(u, "email", ""),
                 "role": getattr(u, "role", "user"),
                 "balance": getattr(u, "balance", 0),
             }
@@ -78,12 +67,6 @@ def _validate_bet_amount(bet_amount: int) -> tuple[bool, str]:
 
 
 def _start_game_lock_and_init(room: Room):
-    """
-    Room FULL olduğunda (player2 set edildikten sonra):
-    - iki oyuncudan bet düş (kilitle)
-    - AccountTransaction yaz
-    - room state init et (secret/current_turn/started_at/is_locked/turn_count)
-    """
     if room.is_locked:
         return
     if not room.player1_id or not room.player2_id:
@@ -123,10 +106,8 @@ def _start_game_lock_and_init(room: Room):
     if room.secret_number is None:
         room.secret_number = random.randint(1, 100)
 
-    # yazı-tura: iki oyuncudan random
     room.current_turn_id = random.choice([room.player1_id, room.player2_id])
-
-    room.turn_count = room.turn_count or 0
+    room.turn_count = 0
     room.is_locked = True
     room.status = Room.Status.FULL
     room.started_at = room.started_at or timezone.now()
@@ -134,7 +115,7 @@ def _start_game_lock_and_init(room: Room):
     room.save(
         update_fields=[
             "secret_number",
-            "current_turn",  # field adı bu
+            "current_turn",
             "turn_count",
             "started_at",
             "is_locked",
@@ -152,11 +133,11 @@ class RoomListCreateView(APIView):
             {
                 "id": r.id,
                 "bet_amount": r.bet_amount,
-                "status": r.status,
+                "status": str(r.status).lower(),
                 "player1_id": r.player1_id,
                 "player2_id": r.player2_id,
                 "player_count": r.player_count,
-                "created_at": r.created_at.isoformat() if getattr(r, "created_at", None) else None,
+                "created_at": r.created_at.isoformat() if r.created_at else None,
             }
             for r in rooms
         ]
@@ -179,13 +160,17 @@ class RoomListCreateView(APIView):
         if request.user.balance < bet_amount:
             return Response({"detail": "Insufficient balance to create room"}, status=status.HTTP_400_BAD_REQUEST)
 
-        room = Room.objects.create(bet_amount=bet_amount, status=Room.Status.OPEN, player1=request.user)
+        room = Room.objects.create(
+            bet_amount=bet_amount,
+            status=Room.Status.OPEN,
+            player1=request.user,
+        )
 
         return Response(
             {
                 "id": room.id,
                 "bet_amount": room.bet_amount,
-                "status": room.status,
+                "status": str(room.status).lower(),
                 "player1_id": room.player1_id,
                 "player2_id": room.player2_id,
                 "player_count": room.player_count,
@@ -236,17 +221,15 @@ class TransactionListView(APIView):
     permission_classes = [IsAuthenticated]
 
     def get(self, request):
-        qs = AccountTransaction.objects.filter(user=request.user).select_related("room").order_by("-created_at", "-id")
+        qs = AccountTransaction.objects.filter(user=request.user).select_related("room").order_by("-created_at")[:200]
 
         data = []
-        for t in qs[:200]:
-            created = getattr(t, "created_at", None)
-            amount = int(getattr(t, "amount", 0) or 0)
-            t_type = getattr(t, "type", None)
+        for t in qs:
+            created = t.created_at
+            amount = int(t.amount or 0)
+            t_type = t.type
 
-            room_bet = 0
-            if t.room_id and getattr(t, "room", None):
-                room_bet = int(getattr(t.room, "bet_amount", 0) or 0)
+            room_bet = int(t.room.bet_amount) if t.room_id and t.room else 0
 
             net_change = amount
             if t_type == AccountTransaction.Type.PAYOUT and t.room_id:
@@ -258,13 +241,14 @@ class TransactionListView(APIView):
                     "type": t_type,
                     "amount": amount,
                     "net_change": net_change,
-                    "balance_after": getattr(t, "balance_after", None),
+                    "balance_after": t.balance_after,
                     "room_id": t.room_id,
                     "room_bet_amount": room_bet,
-                    "note": getattr(t, "note", ""),
+                    "note": t.note,
                     "created_at": created.isoformat() if created else None,
                 }
             )
+
         return Response(data)
 
 
@@ -273,8 +257,7 @@ class LeaderboardView(APIView):
 
     def get(self, request):
         qs = User.objects.all().order_by("-balance", "id")[:50]
-        data = [{"id": u.id, "username": u.username, "balance": getattr(u, "balance", 0)} for u in qs]
-        return Response(data)
+        return Response([{"id": u.id, "username": u.username, "balance": getattr(u, "balance", 0)} for u in qs])
 
 
 @login_required
@@ -311,12 +294,7 @@ def play_room_view(request, room_id: int):
                     room.save(update_fields=["player2", "status"])
                     return render(request, "game/play_room.html", {"error": str(e), "room_id": room_id}, status=400)
             else:
-                return render(
-                    request,
-                    "game/play_room.html",
-                    {"error": "Bu odaya katılımcı değilsin.", "room_id": room_id},
-                    status=403,
-                )
+                return render(request, "game/play_room.html", {"error": "Bu odaya katılımcı değilsin.", "room_id": room_id}, status=403)
 
     return render(request, "game/play_room.html", {"room_id": room_id})
 

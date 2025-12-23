@@ -59,7 +59,7 @@ class Room(models.Model):
         on_delete=models.SET_NULL,
     )
 
-    # Akış
+    # Akış / metrik
     is_locked = models.BooleanField(default=False, db_index=True)
     started_at = models.DateTimeField(null=True, blank=True)
     finished_at = models.DateTimeField(null=True, blank=True)
@@ -70,12 +70,6 @@ class Room(models.Model):
     @property
     def player_count(self) -> int:
         return 1 + (1 if self.player2_id else 0)
-
-    @property
-    def duration_seconds(self):
-        if self.started_at and self.finished_at:
-            return int((self.finished_at - self.started_at).total_seconds())
-        return None
 
     def __str__(self):
         return f"Room(id={self.id}, bet={self.bet_amount}, status={self.status})"

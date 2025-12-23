@@ -1,9 +1,8 @@
 from django.contrib import admin
-from django.urls import path
+from django.urls import path, include
 
 from game.views import (
-    ApiLoginView,
-    MeView,
+    MeView as GameMeView,
     RoomListCreateView,
     RoomJoinView,
     TransactionListView,
@@ -15,13 +14,15 @@ from game.views import (
 urlpatterns = [
     path("admin/", admin.site.urls),
 
-    # UI (Django template)
+    # Django template UI
     path("", lobby_view, name="lobby"),
     path("play/<int:room_id>/", play_room_view, name="play-room"),
 
-    # API
-    path("api/auth/login/", ApiLoginView.as_view(), name="api-login"),
-    path("api/me/", MeView.as_view(), name="api-me"),
+    # Auth API (tek yer!)
+    path("api/auth/", include("users.urls")),
+
+    # Game API
+    path("api/me/", GameMeView.as_view(), name="api-me"),
     path("api/rooms/", RoomListCreateView.as_view(), name="api-rooms"),
     path("api/rooms/<int:room_id>/join/", RoomJoinView.as_view(), name="api-room-join"),
     path("api/transactions/", TransactionListView.as_view(), name="api-transactions"),

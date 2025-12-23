@@ -21,7 +21,7 @@ class RoomConsumer(AsyncJsonWebsocketConsumer):
             self.group_name = f"room_{self.room_id}"
 
             user = self.scope.get("user")
-            if not user or not user.is_authenticated:
+            if not user or not getattr(user, "is_authenticated", False):
                 await self.close(code=4401)
                 return
 
@@ -30,22 +30,42 @@ class RoomConsumer(AsyncJsonWebsocketConsumer):
                 await self.close(code=4404)
                 return
 
-            if user.id not in (state["player1_id"], state["player2_id"]):
+            # participant kontrolü: player2 None ise sadece player1 kabul
+            allowed_ids = [state["player1_id"]]
+            if state["player2_id"]:
+                allowed_ids.append(state["player2_id"])
+
+            if user.id not in allowed_ids:
                 await self.close(code=4403)
                 return
 
             await self.accept()
             await self.channel_layer.group_add(self.group_name, self.channel_name)
 
-            # player2 yoksa bekle modu
-            if state["player2_id"] is None:
-                await self.send_json({"type": "SNAPSHOT", "payload": state["snapshot"]})
+            # Her durumda snapshot gönder
+            await self.send_json({"type": "SNAPSHOT", "payload": state["snapshot"]})
+
+            # FULL değilse sadece bekle
+            if state["player2_id"] is None or state["status"] != "full":
                 await self.send_json({"type": "INFO", "payload": {"detail": "Waiting for second player"}})
                 return
 
-            # player2 varsa FULL + init + lock
-            state = await self.db_force_full_init_and_lock()
-            await self.send_json({"type": "SNAPSHOT", "payload": state["snapshot"]})
+            # FULL ise: oyun başlat + bet lock (idempotent)
+            started = await self.db_start_game_if_ready()
+            await self.send_json({"type": "SNAPSHOT", "payload": started["snapshot"]})
+
+            # herkes görsün diye event bas
+            await self.channel_layer.group_send(
+                self.group_name,
+                {
+                    "type": "room.event",
+                    "payload": {
+                        "event": "GAME_STARTED",
+                        "turn": started["snapshot"].get("turn"),
+                        "turn_count": started["snapshot"].get("turn_count"),
+                    },
+                },
+            )
 
         except Exception as e:
             logger.exception("RoomConsumer.connect failed")
@@ -62,25 +82,28 @@ class RoomConsumer(AsyncJsonWebsocketConsumer):
             pass
 
     async def receive_json(self, content, **kwargs):
+        msg_type = content.get("type")
+
+        if msg_type != "GUESS":
+            await self.send_json({"type": "ERROR", "payload": {"detail": "Unknown message type"}})
+            return
+
+        payload = content.get("payload") or {}
         try:
-            msg_type = content.get("type")
-            if msg_type != "GUESS":
-                await self.send_json({"type": "ERROR", "payload": {"detail": "Unknown message type"}})
-                return
-
-            payload = content.get("payload") or {}
             value = int(payload.get("value"))
-            await self.handle_guess(value)
+        except Exception:
+            await self.send_json({"type": "ERROR", "payload": {"detail": "Invalid guess value"}})
+            return
 
-        except Exception as e:
-            await self.send_json({"type": "ERROR", "payload": {"detail": f"{type(e).__name__}: {str(e)}"}})
+        await self.handle_guess(value)
 
     async def handle_guess(self, value: int):
         user = self.scope.get("user")
-        if not user or not user.is_authenticated:
+        if not user or not getattr(user, "is_authenticated", False):
             await self.send_json({"type": "ERROR", "payload": {"detail": "Authentication required"}})
             return
 
+        # Güncel state al
         state = await self.db_get_room_state()
         if state is None:
             await self.send_json({"type": "ERROR", "payload": {"detail": "Room not found"}})
@@ -90,22 +113,19 @@ class RoomConsumer(AsyncJsonWebsocketConsumer):
             await self.send_json({"type": "ERROR", "payload": {"detail": "Game already finished"}})
             return
 
-        # player2 yoksa / FULL değilse guess yok
+        # 2. oyuncu yoksa guess YASAK
         if state["player2_id"] is None or state["status"] != "full":
-            state = await self.db_force_full_init_and_lock()
-            if state["player2_id"] is None or state["status"] != "full":
-                await self.send_json({"type": "ERROR", "payload": {"detail": "Waiting for second player"}})
-                return
-
-        if user.id not in (state["player1_id"], state["player2_id"]):
-            await self.send_json({"type": "ERROR", "payload": {"detail": "Not a participant"}})
+            await self.send_json({"type": "ERROR", "payload": {"detail": "Waiting for second player"}})
             return
+
+        # FULL ise oyun startı garanti et (idempotent)
+        state = await self.db_start_game_if_ready()
 
         if state["current_turn_id"] != user.id:
             await self.send_json({"type": "ERROR", "payload": {"detail": "Not your turn"}})
             return
 
-        # doğru tahmin -> finish + payout
+        # doğru tahmin -> finish
         if value == state["secret_number"]:
             end_state = await self.db_finish_room_and_payout(winner_user_id=user.id)
 
@@ -115,10 +135,8 @@ class RoomConsumer(AsyncJsonWebsocketConsumer):
                     "type": "room.event",
                     "payload": {
                         "event": "GAME_OVER",
-                        "result": "correct",
                         "winner": end_state["winner_username"],
                         "number": value,
-                        "status": end_state["status"],
                         "turn_count": end_state["turn_count"],
                         "finished_at": end_state["finished_at"],
                     },
@@ -135,6 +153,7 @@ class RoomConsumer(AsyncJsonWebsocketConsumer):
                 "type": "room.event",
                 "payload": {
                     "event": "GUESS",
+                    "by": user.username,
                     "value": value,
                     "result": hint,
                     "next_turn": next_state["current_turn_username"],
@@ -146,7 +165,7 @@ class RoomConsumer(AsyncJsonWebsocketConsumer):
     async def room_event(self, event):
         await self.send_json({"type": "GAME_EVENT", "payload": event["payload"]})
 
-    # ---------------- DB ----------------
+    # ---------------- DB layer ----------------
 
     @database_sync_to_async
     def db_get_room_state(self):
@@ -157,7 +176,15 @@ class RoomConsumer(AsyncJsonWebsocketConsumer):
         return self._state_from_room(room)
 
     @database_sync_to_async
-    def db_force_full_init_and_lock(self):
+    def db_start_game_if_ready(self):
+        """
+        SADECE: player2 varsa ve status FULL ise
+        - secret_number üret
+        - current_turn yazı-tura
+        - bet lock + transaction
+        - started_at set
+        Bu fonksiyon idempotent: bir kez çalışır.
+        """
         with transaction.atomic():
             room = (
                 Room.objects.select_for_update()
@@ -165,80 +192,75 @@ class RoomConsumer(AsyncJsonWebsocketConsumer):
                 .get(id=self.room_id)
             )
 
-            changed = False
+            # güvenlik: player2 yokken ASLA başlatma
+            if room.player2_id is None:
+                return self._state_from_room(room)
 
-            # player2 var ama FULL değilse FULL'a çek
-            if room.player2_id is not None and room.status not in (Room.Status.FULL, Room.Status.FINISHED):
+            # FULL değilse full'a çek (join sonrası bazen gecikebilir)
+            if room.status not in (Room.Status.FULL, Room.Status.FINISHED):
                 room.status = Room.Status.FULL
-                changed = True
+                room.save(update_fields=["status"])
+
+            # zaten kilitlendiyse sadece state dön
+            if room.is_locked:
+                room.refresh_from_db()
+                return self._state_from_room(room)
 
             # init secret
             if room.secret_number is None:
                 room.secret_number = random.randint(1, 100)
-                changed = True
 
-            # init turn
+            # init turn (yazı-tura)
             if room.current_turn_id is None:
-                if room.player2_id is not None:
-                    room.current_turn_id = random.choice([room.player1_id, room.player2_id])
-                else:
-                    room.current_turn = room.player1
-                changed = True
+                room.current_turn_id = random.choice([room.player1_id, room.player2_id])
 
-            if room.turn_count is None:
-                room.turn_count = 0
-                changed = True
+            room.turn_count = room.turn_count or 0
 
-            # Bet lock: sadece 1 kere
-            if room.player2_id is not None and room.status == Room.Status.FULL and not room.is_locked:
-                bet = int(room.bet_amount)
+            # bet lock
+            bet = int(room.bet_amount)
+            p1 = User.objects.select_for_update().get(id=room.player1_id)
+            p2 = User.objects.select_for_update().get(id=room.player2_id)
 
-                p1 = User.objects.select_for_update().get(id=room.player1_id)
-                p2 = User.objects.select_for_update().get(id=room.player2_id)
+            if p1.balance < bet or p2.balance < bet:
+                raise ValueError("Insufficient balance to lock bet")
 
-                if p1.balance < bet or p2.balance < bet:
-                    raise ValueError("Insufficient balance to lock bet")
+            p1.balance -= bet
+            p2.balance -= bet
+            p1.save(update_fields=["balance"])
+            p2.save(update_fields=["balance"])
 
-                p1.balance -= bet
-                p2.balance -= bet
-                p1.save(update_fields=["balance"])
-                p2.save(update_fields=["balance"])
+            AccountTransaction.objects.create(
+                user=p1,
+                room=room,
+                type=AccountTransaction.Type.BET_LOCK,
+                amount=-bet,
+                balance_after=p1.balance,
+                note=f"Bet lock for room {room.id}",
+            )
+            AccountTransaction.objects.create(
+                user=p2,
+                room=room,
+                type=AccountTransaction.Type.BET_LOCK,
+                amount=-bet,
+                balance_after=p2.balance,
+                note=f"Bet lock for room {room.id}",
+            )
 
-                AccountTransaction.objects.create(
-                    user=p1,
-                    room=room,
-                    type=AccountTransaction.Type.BET_LOCK,
-                    amount=-bet,
-                    balance_after=p1.balance,
-                    note=f"Bet lock for room {room.id}",
-                )
-                AccountTransaction.objects.create(
-                    user=p2,
-                    room=room,
-                    type=AccountTransaction.Type.BET_LOCK,
-                    amount=-bet,
-                    balance_after=p2.balance,
-                    note=f"Bet lock for room {room.id}",
-                )
+            room.is_locked = True
+            room.started_at = room.started_at or timezone.now()
 
-                room.is_locked = True
-                room.started_at = room.started_at or timezone.now()
-                changed = True
-
-            if changed:
-                room.save(
-                    update_fields=[
-                        "status",
-                        "secret_number",
-                        "current_turn",
-                        "turn_count",
-                        "is_locked",
-                        "started_at",
-                    ]
-                )
+            room.save(
+                update_fields=[
+                    "status",
+                    "secret_number",
+                    "current_turn",
+                    "turn_count",
+                    "is_locked",
+                    "started_at",
+                ]
+            )
 
             room.refresh_from_db()
-            room = Room.objects.select_related("player1", "player2", "current_turn", "winner").get(id=self.room_id)
             return self._state_from_room(room)
 
     @database_sync_to_async
@@ -251,19 +273,7 @@ class RoomConsumer(AsyncJsonWebsocketConsumer):
             )
 
             room.turn_count = (room.turn_count or 0) + 1
-
-            if room.player2_id is None:
-                if room.current_turn_id is None:
-                    room.current_turn = room.player1
-                room.save(update_fields=["current_turn", "turn_count"])
-                room.refresh_from_db()
-                return {
-                    "current_turn_id": room.current_turn_id,
-                    "current_turn_username": room.current_turn.username if room.current_turn else None,
-                    "turn_count": room.turn_count,
-                }
-
-            room.current_turn = room.player2 if room.current_turn_id == room.player1_id else room.player1
+            room.current_turn_id = room.player2_id if room.current_turn_id == room.player1_id else room.player1_id
             room.save(update_fields=["current_turn", "turn_count"])
             room.refresh_from_db()
 
@@ -276,11 +286,14 @@ class RoomConsumer(AsyncJsonWebsocketConsumer):
     @database_sync_to_async
     def db_finish_room_and_payout(self, winner_user_id: int):
         with transaction.atomic():
-            room = Room.objects.select_for_update().select_related("winner", "player1", "player2").get(id=self.room_id)
+            room = (
+                Room.objects.select_for_update()
+                .select_related("winner", "player1", "player2")
+                .get(id=self.room_id)
+            )
 
             if room.status == Room.Status.FINISHED:
                 return {
-                    "status": "finished",
                     "winner_username": room.winner.username if room.winner else None,
                     "turn_count": room.turn_count,
                     "finished_at": room.finished_at.isoformat() if room.finished_at else None,
@@ -289,13 +302,10 @@ class RoomConsumer(AsyncJsonWebsocketConsumer):
             bet = int(room.bet_amount)
             payout = 2 * bet
 
-            # doğru tahmin de bir guess sayıldığı için +1
-            room.turn_count = (room.turn_count or 0) + 1
-
             room.status = Room.Status.FINISHED
             room.winner_id = winner_user_id
             room.finished_at = timezone.now()
-            room.save(update_fields=["status", "winner", "finished_at", "turn_count"])
+            room.save(update_fields=["status", "winner", "finished_at"])
 
             winner = User.objects.select_for_update().get(id=winner_user_id)
             winner.balance += payout
@@ -310,9 +320,7 @@ class RoomConsumer(AsyncJsonWebsocketConsumer):
                 note=f"Payout for room {room.id}",
             )
 
-            room.refresh_from_db()
             return {
-                "status": "finished",
                 "winner_username": room.winner.username if room.winner else None,
                 "turn_count": room.turn_count,
                 "finished_at": room.finished_at.isoformat() if room.finished_at else None,
@@ -320,6 +328,7 @@ class RoomConsumer(AsyncJsonWebsocketConsumer):
 
     def _state_from_room(self, room: Room):
         status_str = str(room.status).lower()
+
         snapshot = {
             "room": room.id,
             "status": status_str,
@@ -333,11 +342,12 @@ class RoomConsumer(AsyncJsonWebsocketConsumer):
             "finished_at": room.finished_at.isoformat() if room.finished_at else None,
             "turn_count": room.turn_count,
         }
+
         return {
             "player1_id": room.player1_id,
             "player2_id": room.player2_id,
             "status": status_str,
-            "secret_number": room.secret_number,
+            "secret_number": room.secret_number,        # frontend'e göstermiyorsun zaten, WS iç state
             "current_turn_id": room.current_turn_id,
             "snapshot": snapshot,
         }

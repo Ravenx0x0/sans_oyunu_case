@@ -1,8 +1,9 @@
 from urllib.parse import parse_qs
 
+from channels.middleware import BaseMiddleware
 from django.contrib.auth.models import AnonymousUser
-from channels.db import database_sync_to_async
 from rest_framework.authtoken.models import Token
+from channels.db import database_sync_to_async
 
 
 @database_sync_to_async
@@ -14,30 +15,19 @@ def _get_user_from_token(token_key: str):
         return AnonymousUser()
 
 
-class TokenAuthMiddleware:
+class TokenAuthMiddleware(BaseMiddleware):
     """
-    WebSocket için:
-    ws://127.0.0.1:8001/ws/rooms/6/?token=YOUR_TOKEN
-
-    - token varsa TokenAuthentication gibi user set eder
-    - token yoksa scope['user'] (session) neyse onu korur
+    ws://.../?token=xxxxx şeklinde gelen token'ı okuyup scope['user'] set eder.
     """
-
-    def __init__(self, inner):
-        self.inner = inner
 
     async def __call__(self, scope, receive, send):
-        # Zaten session ile authenticated geldiyse dokunma
-        user = scope.get("user")
-        if user and getattr(user, "is_authenticated", False):
-            return await self.inner(scope, receive, send)
-
-        qs = parse_qs(scope.get("query_string", b"").decode())
-        token_key = (qs.get("token") or [None])[0]
+        query_string = scope.get("query_string", b"").decode("utf-8")
+        params = parse_qs(query_string)
+        token_key = (params.get("token") or [None])[0]
 
         if token_key:
             scope["user"] = await _get_user_from_token(token_key)
         else:
-            scope["user"] = scope.get("user") or AnonymousUser()
+            scope["user"] = AnonymousUser()
 
-        return await self.inner(scope, receive, send)
+        return await super().__call__(scope, receive, send)
