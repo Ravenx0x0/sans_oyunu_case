@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import RoomPlay from "./RoomPlay.jsx";
+import RoomPlay from "./RoomPlay";
 
 const API_BASE = "http://127.0.0.1:8001";
 
