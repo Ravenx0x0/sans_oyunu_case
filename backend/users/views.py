@@ -43,6 +43,7 @@ class SignupView(APIView):
 
         with transaction.atomic():
             user = User.objects.create_user(username=username, password=password, email=email)
+
             # balance alanı varsa 1000 ver
             if hasattr(user, "balance"):
                 user.balance = 1000
@@ -65,10 +66,14 @@ class LoginView(APIView):
     permission_classes = [AllowAny]
 
     def post(self, request):
-        username = request.data.get("username")
-        password = request.data.get("password")
+        username = (request.data.get("username") or "").strip()
+        password = request.data.get("password") or ""
 
-        user = authenticate(username=username, password=password)
+        if not username or not password:
+            return Response({"detail": "username and password are required"}, status=400)
+
+        # request'i de verelim (bazı backendlerde auth backend request kullanır)
+        user = authenticate(request=request, username=username, password=password)
         if not user:
             return Response(
                 {"non_field_errors": ["Unable to log in with provided credentials."]},
@@ -97,3 +102,7 @@ class MeView(APIView):
                 "balance": getattr(u, "balance", 0),
             }
         )
+
+
+# --- Backward compatible aliases (eğer eski importlar varsa patlamasın diye) ---
+RegisterView = SignupView
